@@ -4,6 +4,7 @@ use dirs::{config_dir, home_dir};
 use clap::{Parser, crate_name};
 use serde::{Deserialize, Serialize};
 use blake3::Hasher;
+use junk_file::is_junk;
 
 #[derive(thiserror::Error, Debug)]
 enum Error {
@@ -15,12 +16,22 @@ enum Error {
     AbAv1CommandFailed(ExitStatus),
     #[error("Failed to execute force crf ffmpeg command: {0}")]
     ForceCrfFfmpegCommandFailed(ExitStatus),
-    #[error("Conflict between video path and encoding video path {1:?} for video {0:?}")]
+    #[error("Conflict encoding video path {1:?} for video {0:?}")]
     ConflictVideoEncoding(PathBuf, PathBuf),
+    #[error("Conflict failed copy path {1:?} for video {0:?}")]
+    ConflictFailedCopyPath(PathBuf, PathBuf),
     #[error("Save path already exists for single encode: {0}")]
     SingleEncodeSavePathAlreadyExists(PathBuf),
     #[error("Single encode failed with invalid encoded file: {0}")]
     SingleEncodeFailedWithInvalidEncodedFile(PathBuf, PathBuf),
+    #[error("Failed to execute ffprobe check valid video: {0}")]
+    FfprobeCheckValidVideoFailed(String),
+    #[error("Failed to execute ffprobe show duration: {0}")]
+    FfprobeShowDurationFailed(String),
+    #[error("Failed to parse duration decounds string: {0}")]
+    ParseDurationSecondsFailed(String),
+    #[error("Found invalid video file in saved path: {0}")]
+    FoundInvalidVideoFileInSavedPath(PathBuf),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -30,6 +41,9 @@ struct Config {
     min_crf: u8,
     max_crf: u8,
     max_encoded_percent: u8,
+    keep_original: bool,
+    move_failed_files: bool,
+    delete_almost_same_files: bool,
 }
 
 impl Default for Config {
@@ -41,6 +55,9 @@ impl Default for Config {
             min_crf: 15,
             max_crf: 50,
             max_encoded_percent: 70,
+            keep_original: true,
+            move_failed_files: false,
+            delete_almost_same_files: false,
         }
     }
 }
@@ -79,7 +96,7 @@ struct ForceCrfSingleOpts {
 fn main() -> Result<()> {
     env_logger::init();
     let config = prepare_config()?;
-    log::info!("Config: {:?}", config);
+    log::debug!("Config: {:?}", config);
 
     let args = Args::parse();
     match args.subcmd {
@@ -99,6 +116,9 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
     let inherited_log_level = env::var("RUST_LOG").unwrap_or("warn".to_string());
     log::debug!("Inherited log level: {}", inherited_log_level);
 
+    let move_failed_files = config.move_failed_files;
+    let delete_almost_same_files = config.delete_almost_same_files;
+
     for video_path in video_paths {
         fs::create_dir_all(&encodnig_video_dir)?;
         fs::create_dir_all(&save_dir)?;
@@ -109,9 +129,48 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
         let encoding_video_path = encodnig_video_dir.join(&video_location_hash).with_extension("mkv");
         let save_path = encoded_file_save_path(&video_path, &config)?;
 
-        if save_path.exists() {
-            log::info!("Skipping video {:?} as it already exists in save directory", video_path);
+        let video_filename = video_path.file_name().ok_or(Error::InvalidVideoPath(video_path.clone()))?;
+        let failed_copy_path = save_dir.join(video_filename);
+
+        if is_junk(&video_path) {
+            println!("Removing junk file: {}", video_path.display());
+            fs::remove_file(&video_path)?;
             continue;
+        }
+
+        if !guess_video_file(&video_path) {
+            println!("Skipping non-video file: {}", video_path.display());
+            continue;
+        }
+
+        if !is_valid_video_file(&video_path)? {
+            println!("Skipping invalid video file: {}", video_path.display());
+            continue;
+        }
+
+        if save_path.exists() {
+            if delete_almost_same_files {
+                if !is_valid_video_file(&save_path)? {
+                    return Err(anyhow!(Error::FoundInvalidVideoFileInSavedPath(save_path)));
+                }
+
+                let duration_of_saved_video = rough_video_secs(&save_path)?;
+                let duration_of_current_video = rough_video_secs(&video_path)?;
+
+                if almost_eq(duration_of_saved_video, duration_of_current_video, 0.01) {
+                    println!("Removing a file having duplicate name, almost equal duration video: {}", video_path.display());
+                    fs::remove_file(&video_path)?;
+                } else {
+                    println!("Skipping video for now, duplicated names, but different durations ({} != {}): {}", duration_of_saved_video, duration_of_current_video, save_path.display());
+                }
+            } else {
+                println!("Skipping video {} as it already exists in save directory", video_path.display());
+            }
+            continue;
+        }
+
+        if move_failed_files && failed_copy_path.exists() {
+            return Err(anyhow!(Error::ConflictFailedCopyPath(video_path, failed_copy_path)));
         }
 
         if encoding_video_path.exists() {
@@ -119,31 +178,41 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
         }
 
         println!("Encoding video: {}", video_path.display());
-        match exec_ab_av1(&video_path, &encoding_video_path, opts.target_vmaf, false, &inherited_log_level, &config) {
-            Ok(_) => log::info!("Encoding successful for {:?}", video_path),
+        let success = match exec_ab_av1(&video_path, &encoding_video_path, opts.target_vmaf, false, &inherited_log_level, &config) {
+            Ok(_) => true,
             Err(e) => {
-                if encoding_video_path.exists() {
-                    fs::remove_file(&encoding_video_path)?;
-                }
                 match e.downcast_ref::<Error>() {
-                    Some(Error::AbAv1CommandFailed(_)) => {
-                        log::warn!("Encoding failed for {:?}: {:?}", video_path, e);
-                        continue;
-                    },
+                    Some(Error::AbAv1CommandFailed(_)) => false,
                     _ => return Err(e),
                 }
             }
-        }
+        };
 
-        if encoding_video_path.exists() && !is_valid_video_file(&encoding_video_path)? {
-            log::warn!("Encoding failed for {:?}: Invalid video file", video_path);
-            fs::remove_file(&encoding_video_path)?;
-            continue;
-        }
+        if success {
+            if encoding_video_path.exists() && !is_valid_video_file(&encoding_video_path)? {
+                log::warn!("Encoding failed for {:?}: Invalid video file", video_path);
+                fs::remove_file(&encoding_video_path)?;
+                continue;
+            }
 
-        println!("Saving video ...");
-        rename_file(&encoding_video_path, &save_path)?;
-        log::info!("Saved encoded video to {:?}", save_path);
+            println!("Saving video ...");
+            rename_file(&encoding_video_path, &save_path)?;
+            log::debug!("Saved encoded video to {:?}", save_path);
+
+            if !config.keep_original {
+                println!("Removing original video ...");
+                fs::remove_file(&video_path)?;
+                log::debug!("Removed original video {:?}", video_path);
+            }
+        } else {
+            if encoding_video_path.exists() {
+                fs::remove_file(&encoding_video_path)?;
+            }
+            if move_failed_files {
+                println!("Moving failed video ...");
+                rename_file(&video_path, &failed_copy_path)?;
+            }
+        }
     }
 
     Ok(())
@@ -152,8 +221,8 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
 fn run_debug_single_command(opts: DebugSingleOpts, config: Config) -> Result<()> {
     let output_path = config.save_dir.join("output.mp4");
 
-    log::info!("Running debug single command with opts: {:?}", opts);
-    log::info!("Output path: {:?}", output_path);
+    log::debug!("Running debug single command with opts: {:?}", opts);
+    log::debug!("Output path: {:?}", output_path);
 
     exec_ab_av1(&opts.video_path, &output_path, opts.target_vmaf, true, "debug", &config)
 }
@@ -280,7 +349,7 @@ fn prepare_config() -> Result<Config> {
         let default_config = Config::default();
         let toml = toml::to_string_pretty(&default_config)?;
         std::fs::write(&config_path, toml)?;
-        log::info!("Default config written to {:?}", config_path);
+        log::debug!("Default config written to {:?}", config_path);
     }
     let config = config::Config::builder()
         .add_source(config::File::from(config_path))
@@ -323,6 +392,13 @@ fn encoded_file_save_path(video_path: impl AsRef<Path>, config: &Config) -> Resu
     Ok(save_path)
 }
 
+fn guess_video_file(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    let guess = mime_guess::from_path(path);
+    let mut iter = guess.iter();
+    iter.any(|mime| mime.type_() == "video")
+}
+
 fn is_valid_video_file(video_path: impl AsRef<Path>) -> Result<bool> {
     let video_path = video_path.as_ref();
 
@@ -334,10 +410,31 @@ fn is_valid_video_file(video_path: impl AsRef<Path>) -> Result<bool> {
         .arg("-of").arg("csv=p=0")
         .arg(video_path);
     log::debug!("Command: {:?}", command);
-    let status = command.status()?;
+    let status = command.status().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("{:?}", e)))?;
     log::debug!("Command status: {:?}", status);
 
     Ok(status.success())
+}
+
+fn rough_video_secs(video_path: impl AsRef<Path>) -> Result<f64> {
+    let video_path = video_path.as_ref();
+
+    let mut command = Command::new("ffprobe");
+    command
+        .arg("-v").arg("quiet")
+        .arg("-show_entries").arg("format=duration")
+        .arg("-of").arg("csv=p=0")
+        .arg(video_path);
+    log::debug!("Command: {:?}", command);
+    let output = command.output().map_err(|e| Error::FfprobeShowDurationFailed(format!("{:?}", e)))?;
+    log::debug!("Command output: {:?}", output);
+
+    let stdout_str = output.stdout;
+    let secs_str = String::from_utf8_lossy(&stdout_str);
+    let secs_str = secs_str.trim();
+    let secs = secs_str.parse::<f64>().map_err(|e| Error::ParseDurationSecondsFailed(format!("Failed parsed \"{}\": {:?}", secs_str, e)))?;
+
+    Ok(secs)
 }
 
 fn walk_dir(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
@@ -364,3 +461,8 @@ fn hash_file_location(file_path: impl AsRef<Path>) -> String {
     hash.to_hex().to_string()
 }
 
+fn almost_eq(a: f64, b: f64, relative_tolerance: f64) -> bool {
+    let min = a.min(b);
+    let max = a.max(b);
+    ((max - min) / max) < relative_tolerance
+}
