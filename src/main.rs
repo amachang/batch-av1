@@ -195,9 +195,13 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
                 continue;
             }
 
+            let start_saving = std::time::Instant::now();
             println!("Saving video ...");
             rename_file(&encoding_video_path, &save_path)?;
-            log::debug!("Saved encoded video to {:?}", save_path);
+            let elapsed = start_saving.elapsed();
+            if elapsed.as_secs() > 10 {
+                println!("Saved in {:.2} sec", elapsed.as_secs_f64());
+            }
 
             if !config.keep_original {
                 println!("Removing original video ...");
@@ -254,8 +258,19 @@ fn run_force_crf_single_command(opts: ForceCrfSingleOpts, config: Config) -> Res
         return Err(anyhow!(Error::SingleEncodeFailedWithInvalidEncodedFile(video_path.clone(), encoding_video_path.clone())));
     }
 
+    let start_saving = std::time::Instant::now();
     println!("Saving video ...");
     rename_file(&encoding_video_path, &save_path)?;
+    let elapsed = start_saving.elapsed();
+    if elapsed.as_secs() > 10 {
+        println!("Saved in {:.2} sec", elapsed.as_secs_f64());
+    }
+
+    if !config.keep_original {
+        println!("Removing original video ...");
+        fs::remove_file(&video_path)?;
+        log::debug!("Removed original video {:?}", video_path);
+    }
 
     Ok(())
 }
@@ -410,10 +425,24 @@ fn is_valid_video_file(video_path: impl AsRef<Path>) -> Result<bool> {
         .arg("-of").arg("csv=p=0")
         .arg(video_path);
     log::debug!("Command: {:?}", command);
-    let status = command.status().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("{:?}", e)))?;
-    log::debug!("Command status: {:?}", status);
+    let output = command.output().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("{:?}", e)))?;
+    log::debug!("Command status: {:?}", output.status);
 
-    Ok(status.success())
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    // check w,h
+    let stdout_str = output.stdout;
+    let stdout_str = String::from_utf8_lossy(&stdout_str);
+    let stdout_str = stdout_str.trim();
+    let mut iter = stdout_str.split(',');
+    let width_str = iter.next().ok_or(Error::FfprobeCheckValidVideoFailed(format!("Failed to get width,height: {:?}", stdout_str)))?;
+    let height_str = iter.next().ok_or(Error::FfprobeCheckValidVideoFailed(format!("Failed to get width,height: {:?}", stdout_str)))?;
+    let width = width_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse width: {:?}", e)))?;
+    let height = height_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse height: {:?}", e)))?;
+
+    Ok(width > 0 && height > 0)
 }
 
 fn rough_video_secs(video_path: impl AsRef<Path>) -> Result<f64> {
