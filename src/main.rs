@@ -1,6 +1,6 @@
 use std::{path::PathBuf, fs, process::{Command, ExitStatus}, path::Path, env};
 use anyhow::{Result, anyhow};
-use dirs::{config_dir, home_dir};
+use dirs::home_dir;
 use clap::{Parser, crate_name};
 use serde::{Deserialize, Serialize};
 use blake3::Hasher;
@@ -8,8 +8,6 @@ use junk_file::is_junk;
 
 #[derive(thiserror::Error, Debug)]
 enum Error {
-    #[error("Could not find config directory")]
-    ConfigDirNotFound,
     #[error("Invalid video path: {0}")]
     InvalidVideoPath(PathBuf),
     #[error("Failed to execute ab-av1 command: {0}")]
@@ -112,7 +110,8 @@ struct ForceCrfSingleOpts {
 
 fn main() -> Result<()> {
     env_logger::init();
-    let config = prepare_config()?;
+    jdt::use_from(crate_name!());
+    let config = jdt::config();
     log::debug!("Config: {:?}", config);
 
     let args = Args::parse();
@@ -126,7 +125,7 @@ fn main() -> Result<()> {
 }
 
 fn run_all(opts: AllOpts, config: Config) -> Result<()> {
-    let video_paths = walk_dir(&opts.video_dir)?;
+    let video_paths = jdt::walk_dir(&opts.video_dir, |path| path);
     let encodnig_video_dir = config.tmp_dir.join("encoding");
     let save_dir = &config.save_dir;
 
@@ -174,7 +173,7 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
                 let duration_of_saved_video = rough_video_secs(&save_path)?;
                 let duration_of_current_video = rough_video_secs(&video_path)?;
 
-                if almost_eq(duration_of_saved_video, duration_of_current_video, 0.01) {
+                if jdt::almost_eq(duration_of_saved_video, duration_of_current_video, 0.01) {
                     println!("Removing a file having duplicate name, almost equal duration video: {}", video_path.display());
                     fs::remove_file(&video_path)?;
                 } else {
@@ -214,7 +213,7 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
 
             let start_saving = std::time::Instant::now();
             println!("Saving video to: {}", save_path.display());
-            rename_file(&encoding_video_path, &save_path)?;
+            jdt::rename_file(&encoding_video_path, &save_path)?;
             let elapsed = start_saving.elapsed();
             if elapsed.as_secs() > 10 {
                 println!("Saved in {:.2} sec", elapsed.as_secs_f64());
@@ -231,7 +230,7 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
             }
             if move_failed_files {
                 println!("Moving failed video ...");
-                rename_file(&video_path, &failed_copy_path)?;
+                jdt::rename_file(&video_path, &failed_copy_path)?;
             }
         }
     }
@@ -277,7 +276,7 @@ fn run_force_crf_single_command(opts: ForceCrfSingleOpts, config: Config) -> Res
 
     let start_saving = std::time::Instant::now();
     println!("Saving video to: {}", save_path.display());
-    rename_file(&encoding_video_path, &save_path)?;
+    jdt::rename_file(&encoding_video_path, &save_path)?;
     let elapsed = start_saving.elapsed();
     if elapsed.as_secs() > 10 {
         println!("Saved in {:.2} sec", elapsed.as_secs_f64());
@@ -371,44 +370,6 @@ fn exec_force_crf_ffmpeg(input_path: impl AsRef<Path>, output_path: impl AsRef<P
     }
 }
 
-fn prepare_config() -> Result<Config> {
-    let config_parent_dir = config_dir().ok_or(Error::ConfigDirNotFound)?;
-    let config_dir = config_parent_dir.join(crate_name!());
-    fs::create_dir_all(&config_dir)?;
-
-    let config_path = config_dir.join("config.toml");
-    if !config_path.exists() {
-        let default_config = Config::default();
-        let toml = toml::to_string_pretty(&default_config)?;
-        std::fs::write(&config_path, toml)?;
-        log::debug!("Default config written to {:?}", config_path);
-    }
-    let config = config::Config::builder()
-        .add_source(config::File::from(config_path))
-        .build()?;
-    let config = config.try_deserialize::<Config>()?;
-
-    Ok(config)
-}
-
-fn rename_file(from_path: impl AsRef<Path>, to_path: impl AsRef<Path>) -> Result<()> {
-    let from_path = from_path.as_ref();
-    let to_path = to_path.as_ref();
-    match fs::rename(from_path, to_path) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            match e.raw_os_error() {
-                Some(libc::EXDEV) => {
-                    fs::copy(from_path, to_path)?;
-                    fs::remove_file(from_path)?;
-                    Ok(())
-                },
-                _ => Err(e.into()),
-            }
-        }
-    }
-}
-
 fn encoded_file_save_path(video_path: impl AsRef<Path>, config: &Config) -> Result<PathBuf> {
     let video_path = video_path.as_ref();
     let save_dir = &config.save_dir;
@@ -486,20 +447,6 @@ fn rough_video_secs(video_path: impl AsRef<Path>) -> Result<f64> {
     Ok(secs)
 }
 
-fn walk_dir(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            paths.extend(walk_dir(&path)?);
-        } else {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
-}
-
 fn hash_file_location(file_path: impl AsRef<Path>) -> String {
     let file_path = file_path.as_ref();
     let file_path_bytes = file_path.as_os_str().as_encoded_bytes();
@@ -508,12 +455,6 @@ fn hash_file_location(file_path: impl AsRef<Path>) -> String {
     hasher.update(file_path_bytes);
     let hash = hasher.finalize();
     hash.to_hex().to_string()
-}
-
-fn almost_eq(a: f64, b: f64, relative_tolerance: f64) -> bool {
-    let min = a.min(b);
-    let max = a.max(b);
-    ((max - min) / max) < relative_tolerance
 }
 
 fn destination_filename(path: impl AsRef<Path>, config: &Config) -> Result<String> {

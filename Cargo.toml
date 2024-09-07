@@ -7,13 +7,12 @@ edition = "2021"
 anyhow = "1.0.86"
 blake3 = "1.5.4"
 clap = { version = "4.5.16", features = ["cargo", "derive"] }
-config = "0.14.0"
 dirs = "5.0.1"
 env_logger = "0.11.5"
+jdt = { git = "ssh://git@github.com/amachang/jdt.git", version = "0.1.0" }
 junk_file = "0.1.1"
 libc = "0.2.158"
 log = "0.4.22"
 mime_guess = "2.0.5"
 serde = { version = "1.0.209", features = ["derive"] }
 thiserror = "1.0.63"
-toml = "0.8.19"
