@@ -136,6 +136,8 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
     let delete_almost_same_files = config.delete_almost_same_files;
 
     for video_path in video_paths {
+        log::trace!("Iterate path: {}", video_path.display());
+
         fs::create_dir_all(&encodnig_video_dir)?;
         fs::create_dir_all(&save_dir)?;
 
@@ -416,12 +418,16 @@ fn is_valid_video_file(video_path: impl AsRef<Path>) -> Result<bool> {
     // check w,h
     let stdout_str = output.stdout;
     let stdout_str = String::from_utf8_lossy(&stdout_str);
+
+    // let take the first line
+    let stdout_str = stdout_str.split('\n').next().ok_or(Error::FfprobeCheckValidVideoFailed(format!("Failed to get first line: {:?}", stdout_str)))?;
     let stdout_str = stdout_str.trim();
     let mut iter = stdout_str.split(',');
+
     let width_str = iter.next().ok_or(Error::FfprobeCheckValidVideoFailed(format!("Failed to get width,height: {:?}", stdout_str)))?;
     let height_str = iter.next().ok_or(Error::FfprobeCheckValidVideoFailed(format!("Failed to get width,height: {:?}", stdout_str)))?;
-    let width = width_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse width: {:?}", e)))?;
-    let height = height_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse height: {:?}", e)))?;
+    let width = width_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse width ({}): {:?}", width_str, e)))?;
+    let height = height_str.parse::<u32>().map_err(|e| Error::FfprobeCheckValidVideoFailed(format!("Failed to parse height ({}): {:?}", height_str, e)))?;
 
     Ok(width > 0 && height > 0)
 }
