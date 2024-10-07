@@ -1,4 +1,4 @@
-use std::{path::PathBuf, fs, process::{Command, ExitStatus}, path::Path, env};
+use std::{path::PathBuf, fs, process::{Command, ExitStatus}, path::Path, env, collections::HashMap, ffi::OsStr};
 use anyhow::{Result, anyhow};
 use dirs::home_dir;
 use clap::{Parser, crate_name};
@@ -30,12 +30,6 @@ enum Error {
     ParseDurationSecondsFailed(String),
     #[error("Found invalid video file in saved path: {0}")]
     FoundInvalidVideoFileInSavedPath(PathBuf),
-    #[error("Renamer command failed: {0}")]
-    RenamerCommandFailed(String, ExitStatus),
-    #[error("Too many characters in renamed filename: {0}")]
-    TooManyCharsInRenamedFilename(String),
-    #[error("Too many bytes in renamed filename: {0}")]
-    TooManyBytesInRenamedFilename(String),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -48,16 +42,7 @@ struct Config {
     keep_original: bool,
     move_failed_files: bool,
     delete_almost_same_files: bool,
-    #[serde(default)]
-    renamer: Option<RenamerConfig>,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-struct RenamerConfig {
-    command: String,
-    args: Vec<String>,
-    bytes_limit: usize,
-    chars_limit: usize,
+    save_dir_overrides: HashMap<String, PathBuf>,
 }
 
 impl Default for Config {
@@ -72,7 +57,7 @@ impl Default for Config {
             keep_original: true,
             move_failed_files: false,
             delete_almost_same_files: false,
-            renamer: None,
+            save_dir_overrides: HashMap::new(),
         }
     }
 }
@@ -110,8 +95,7 @@ struct ForceCrfSingleOpts {
 
 fn main() -> Result<()> {
     env_logger::init();
-    jdt::use_from(crate_name!());
-    let config = jdt::config();
+    let config = jdt::project(crate_name!()).config::<Config>();
     log::debug!("Config: {:?}", config);
 
     let args = Args::parse();
@@ -127,7 +111,8 @@ fn main() -> Result<()> {
 fn run_all(opts: AllOpts, config: Config) -> Result<()> {
     let video_paths = jdt::walk_dir(&opts.video_dir, |path| path);
     let encodnig_video_dir = config.tmp_dir.join("encoding");
-    let save_dir = &config.save_dir;
+    let default_save_dir = &config.save_dir;
+    let save_dir_overrides = &config.save_dir_overrides;
 
     let inherited_log_level = env::var("RUST_LOG").unwrap_or("warn".to_string());
     log::debug!("Inherited log level: {}", inherited_log_level);
@@ -139,7 +124,6 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
         log::trace!("Iterate path: {}", video_path.display());
 
         fs::create_dir_all(&encodnig_video_dir)?;
-        fs::create_dir_all(&save_dir)?;
 
         // file_stem sometimes treats the last part of the file name as extension
         // so we impl the way below
@@ -147,7 +131,12 @@ fn run_all(opts: AllOpts, config: Config) -> Result<()> {
         let encoding_video_path = encodnig_video_dir.join(&video_location_hash).with_extension("mkv");
         let save_path = encoded_file_save_path(&video_path, &config)?;
 
-        let dst_video_filename = destination_filename(&video_path, &config)?;
+        let original_filename = video_path.file_name().ok_or(Error::InvalidVideoPath(video_path.clone()))?;
+        let save_dir = save_dir_for_filename(&original_filename, &default_save_dir, &save_dir_overrides);
+        fs::create_dir_all(&save_dir)?;
+        log::debug!("Save dir: ({}, {}, {:?}) -> {}", &original_filename.to_string_lossy().to_string(), default_save_dir.display(), save_dir_overrides, save_dir.display());
+
+        let dst_video_filename = rename_for_linux_limit::new_filename(&video_path, Some(&save_dir))?;
         let failed_copy_path = save_dir.join(dst_video_filename);
 
         if is_junk(&video_path) {
@@ -375,16 +364,18 @@ fn exec_force_crf_ffmpeg(input_path: impl AsRef<Path>, output_path: impl AsRef<P
 fn encoded_file_save_path(video_path: impl AsRef<Path>, config: &Config) -> Result<PathBuf> {
     let video_path = video_path.as_ref();
     let save_dir = &config.save_dir;
+    let save_dir_overrides = &config.save_dir_overrides;
 
     // file_stem sometimes treats the last part of the file name as extension
     // so we impl the way below
     let video_filename = video_path.file_name().ok_or(Error::InvalidVideoPath(video_path.to_path_buf()))?;
+    let save_dir = save_dir_for_filename(&video_path, save_dir, save_dir_overrides);
     let mut iter = video_filename.as_encoded_bytes().rsplitn(1, |&b| b == b'.');
     let video_slug = iter.next().ok_or(Error::InvalidVideoPath(video_path.to_path_buf()))?;
     let video_slug = String::from_utf8_lossy(video_slug).to_string();
 
     let pre_save_path = save_dir.join(&video_slug).with_extension("mkv");
-    let save_video_filename = destination_filename(&pre_save_path, config)?;
+    let save_video_filename = rename_for_linux_limit::new_filename(&pre_save_path, Some(&save_dir))?;
     let save_path = save_dir.join(save_video_filename);
 
     Ok(save_path)
@@ -463,46 +454,17 @@ fn hash_file_location(file_path: impl AsRef<Path>) -> String {
     hash.to_hex().to_string()
 }
 
-fn destination_filename(path: impl AsRef<Path>, config: &Config) -> Result<String> {
-    let path = path.as_ref();
-    let filename = if let Some(renamer_config) = &config.renamer {
-        renamed_video_filename(path, renamer_config)?
-    } else {
-        let filename = path.file_name().ok_or(Error::InvalidVideoPath(path.to_path_buf()))?;
-        let filename = filename.to_string_lossy();
-        filename.to_string()
-    };
-    Ok(filename)
-}
-
-fn renamed_video_filename(path: impl AsRef<Path>, renamer: &RenamerConfig) -> Result<String> {
-    let path = path.as_ref();
-    let filename = path.file_name().ok_or(Error::InvalidVideoPath(path.to_path_buf()))?;
-    let filename = filename.to_string_lossy();
-    if filename.chars().count() <= renamer.chars_limit {
-        if filename.as_bytes().len() <= renamer.bytes_limit {
-            return Ok(filename.to_string());
+fn save_dir_for_filename(filename: impl AsRef<OsStr>, default_save_dir: impl AsRef<Path>, save_dir_overrides: &HashMap<String, PathBuf>) -> PathBuf {
+    let filename = filename.as_ref();
+    let lower_case_filename = filename.to_string_lossy().to_lowercase();
+    let mut save_dir = default_save_dir.as_ref();
+    for (filename_prefix, candidate_save_dir) in save_dir_overrides.iter() {
+        let lower_case_filename_prefix = filename_prefix.to_lowercase();
+        if lower_case_filename.starts_with(&lower_case_filename_prefix) {
+            save_dir = candidate_save_dir;
+            break;
         }
     }
-
-    let mut command = Command::new(&renamer.command);
-    command.args(&renamer.args);
-    command.arg(path);
-
-    let output = command.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(Error::RenamerCommandFailed(stderr, output.status).into());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout.trim();
-    if stdout.chars().count() > renamer.chars_limit {
-        return Err(Error::TooManyCharsInRenamedFilename(stdout.to_string()).into());
-    }
-    if stdout.as_bytes().len() > renamer.bytes_limit {
-        return Err(Error::TooManyBytesInRenamedFilename(stdout.to_string()).into());
-    }
-    Ok(stdout.to_string())
+    save_dir.to_path_buf()
 }
 

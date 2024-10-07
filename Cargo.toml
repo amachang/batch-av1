@@ -10,6 +10,7 @@ clap = { version = "4.5.16", features = ["cargo", "derive"] }
 dirs = "5.0.1"
 env_logger = "0.11.5"
 jdt = { git = "ssh://git@github.com/amachang/jdt.git", version = "0.1.0" }
+rename-for-linux-limit = { git = "ssh://git@github.com/amachang/rename-for-linux-limit.git", version = "0.1.0" }
 junk_file = "0.1.1"
 libc = "0.2.158"
 log = "0.4.22"
